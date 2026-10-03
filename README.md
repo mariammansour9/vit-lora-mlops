@@ -61,4 +61,4 @@ Example response:
 - Quantization is PyTorch **dynamic INT8** on all `nn.Linear` layers (~4x smaller, CPU only).
   Use the same `torch` version for quantizing and serving.
 - Merging LoRA before quantizing means the container needs no `peft` dependency.
-- Env vars: `MODEL_DIR`, `MAX_UPLOAD_MB`, `TORCH_THREADS`.
+- Env vars: `MODEL_DIR` (default `models/quantized`), `MAX_UPLOAD_MB` (10), `TORCH_THREADS` (all cores).
