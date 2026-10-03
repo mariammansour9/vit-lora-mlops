@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir torch==2.4.1 --index-url https://download.pytorch
 COPY src/ ./src/
 COPY models/quantized ./models/quantized
 
-RUN useradd -m appuser && chown -R appuser /app
+RUN useradd -m appuser && mkdir -p /app/logs && chown -R appuser /app
 USER appuser
 
 EXPOSE 8000

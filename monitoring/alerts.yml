@@ -1,0 +1,50 @@
+groups:
+  - name: model
+    rules:
+      - alert: DataDriftHigh
+        expr: vit_drift_psi_max > 0.25
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "Input/prediction drift: PSI {{ $value | printf \"%.2f\" }} > 0.25 - consider retraining"}
+      - alert: DataDriftWarning
+        expr: vit_drift_psi_max > 0.1 and vit_drift_psi_max <= 0.25
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: "Moderate drift (PSI {{ $value | printf \"%.2f\" }})"}
+      - alert: ModelAccuracyLow
+        expr: vit_rolling_accuracy < 0.85
+        for: 10m
+        labels: {severity: critical}
+        annotations: {summary: "Rolling accuracy on labelled traffic is {{ $value | printf \"%.2f\" }}"}
+      - alert: LowConfidence
+        expr: histogram_quantile(0.5, sum(rate(vit_prediction_confidence_bucket[10m])) by (le)) < 0.6
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Median prediction confidence dropped below 0.6"}
+  - name: infrastructure
+    rules:
+      - alert: ApiDown
+        expr: up{job="vit-api"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "Inference API is unreachable"}
+      - alert: HighLatencyP95
+        expr: histogram_quantile(0.95, sum(rate(vit_inference_latency_seconds_bucket[5m])) by (le)) > 0.5
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "p95 inference latency > 500 ms"}
+      - alert: HighCPU
+        expr: 100 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100 > 85
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Host CPU above 85%"}
+      - alert: HighMemory
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 90
+        for: 10m
+        labels: {severity: critical}
+        annotations: {summary: "Host memory above 90%"}
+      - alert: DiskAlmostFull
+        expr: (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes) * 100 > 85
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Disk usage above 85%"}

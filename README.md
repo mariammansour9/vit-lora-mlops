@@ -61,4 +61,38 @@ Example response:
 - Quantization is PyTorch **dynamic INT8** on all `nn.Linear` layers (~4x smaller, CPU only).
   Use the same `torch` version for quantizing and serving.
 - Merging LoRA before quantizing means the container needs no `peft` dependency.
-- Env vars: `MODEL_DIR`, `MAX_UPLOAD_MB`, `TORCH_THREADS`.
+- Env vars: `MODEL_DIR` (default `models/quantized`), `MAX_UPLOAD_MB` (10), `TORCH_THREADS` (all cores), `MONITOR_LOG_DIR` (`logs`), `BASELINE_PATH` (`$MODEL_DIR/reference_stats.json`).
+
+## 7. Tests
+```bash
+pip install -r requirements-serve.txt -r requirements-dev.txt
+pytest -q          # monitoring maths, API (tiny random ViT), alert-rule/compose sanity
+```
+
+## 8. CI/CD (GitHub Actions - `.github/workflows/ci.yml`)
+| Trigger | Jobs |
+|---|---|
+| push `feature/**`, `bugfix/**`, PR into `develop`/`main` | `test` |
+| push `develop` | `test` -> `build` (image + smoke test, push to GHCR) -> `deploy-staging` |
+| push `main` or tag `v*` | `test` -> `build` -> `deploy-production` (needs approval via the `production` environment) |
+| nightly cron | `monitoring-check` (drift / accuracy gate) |
+
+Branching model: `feature/*` -> PR -> `develop` -> release merge -> `main` (tagged `vX.Y.Z`).
+See `docs/GIT_WORKFLOW.md` for the full git session (add/commit/pull/push/merge/conflict/diff/status).
+
+## 9. Observability (AI + infrastructure)
+```bash
+docker compose up --build      # API :8000, Prometheus :9090, Grafana :3000 (admin/admin)
+```
+**Model / data monitoring** (`src/monitoring.py`, exposed at `/metrics`, `/monitoring/drift`, `/feedback`)
+- Every prediction is logged (`logs/predictions.jsonl`) with the predicted class, confidence, latency and input statistics (brightness, contrast, mean R/G/B).
+- **Data drift**: PSI (and KS) of live inputs, confidence and predicted-class mix vs. a baseline (`reference_stats.json`). PSI < 0.1 ok, 0.1-0.25 warn, > 0.25 alert.
+- **Performance**: ground truth arrives later via `POST /feedback {"request_id", "true_label"}`; the service tracks rolling accuracy, and `monitor_cli report` computes accuracy, macro-F1, per-class F1, label coverage and calibration error (ECE).
+- Without labels, drift + confidence + class distribution act as proxies for model health.
+
+```bash
+python -m src.monitor_cli baseline --model-dir models/quantized --samples 1000 -o models/quantized/reference_stats.json
+python -m src.monitor_cli report   --baseline models/quantized/reference_stats.json --logs logs   # exit 1 on alert
+python -m src.monitor_cli simulate --out logs --n 500 --drift                                     # demo traffic
+```
+**Infrastructure monitoring**: node-exporter (host CPU/memory/disk), cAdvisor (per-container), process metrics from the API, Prometheus alert rules (`monitoring/alerts.yml`: ApiDown, HighLatencyP95, HighCPU, HighMemory, DiskAlmostFull, DataDriftHigh, ModelAccuracyLow, LowConfidence) and a provisioned Grafana dashboard.

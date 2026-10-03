@@ -1,0 +1,169 @@
+name: CI/CD
+
+# Which branch triggers what:
+#   feature/** , bugfix/**  push        -> test
+#   pull_request -> develop | main      -> test
+#   develop        push                 -> test -> build -> deploy-staging
+#   main           push                 -> test -> build -> deploy-production (manual approval)
+#   v* tag         push                 -> same image, tagged with the version
+#   nightly 02:00 UTC                   -> monitoring-check (drift/perf gate on logs)
+#   workflow_dispatch                   -> manual run (choose "deploy" to force a deploy job)
+on:
+  push:
+    branches: [main, develop, "feature/**", "bugfix/**"]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE: ghcr.io/${{ github.repository }}/vit-lora-int8
+
+jobs:
+  # ------------------------------------------------------------------ TEST
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-*.txt
+      - name: Install (CPU torch + serving deps + dev deps)
+        run: |
+          pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-serve.txt -r requirements-dev.txt ruff
+      - name: Lint
+        run: ruff check src tests --select E9,F,B --ignore B008,B905
+      - name: Unit + API + monitoring-config tests
+        run: pytest -q --junitxml=test-results.xml
+      - name: Drift/performance gate demo (healthy traffic must pass, drifted must fail)
+        run: |
+          python -m src.monitor_cli simulate --out /tmp/h --n 500
+          python -m src.monitor_cli baseline --from-log /tmp/h/predictions.jsonl -o /tmp/base.json
+          python -m src.monitor_cli simulate --out /tmp/d --n 500 --drift --seed 7
+          python -m src.monitor_cli report --baseline /tmp/base.json --logs /tmp/h
+          ! python -m src.monitor_cli report --baseline /tmp/base.json --logs /tmp/d
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.xml
+
+  # ------------------------------------------------------------------ BUILD
+  build:
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Provide model weights
+        # Real pipeline: download models/quantized from your model registry / release asset.
+        # Here a tiny random INT8 ViT keeps the build self-contained.
+        run: |
+          pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-serve.txt
+          python -m src.dev_model models/quantized
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=semver,pattern={{version}}
+      - name: Build (loaded locally for the smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: smoke:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test container
+        run: |
+          docker run -d --name api -p 8000:8000 smoke:test
+          for i in $(seq 1 30); do curl -sf localhost:8000/health && break || sleep 2; done
+          curl -sf localhost:8000/health | grep '"ok"'
+          curl -sf localhost:8000/metrics | grep vit_model_loaded
+          docker logs api
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+  # ------------------------------------------------------------------ DEPLOY
+  deploy-staging:
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to staging
+        # Replace with your target (ssh + docker compose pull/up, kubectl set image, Render/Fly hook...)
+        run: |
+          echo "Deploying ${IMAGE}:develop to STAGING"
+          # ssh deploy@staging "cd /srv/vit && IMAGE=${IMAGE}:develop docker compose up -d"
+      - name: Post-deploy health check
+        run: echo "curl -f https://staging.example.com/health"
+
+  deploy-production:
+    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production        # configure "Required reviewers" on this environment = manual approval
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to production
+        run: |
+          echo "Deploying ${IMAGE}:main to PRODUCTION"
+          # ssh deploy@prod "cd /srv/vit && IMAGE=${IMAGE}:main docker compose up -d"
+      - name: Post-deploy health check
+        run: echo "curl -f https://api.example.com/health"
+
+  # ------------------------------------------------------------------ MONITORING (scheduled)
+  monitoring-check:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install numpy
+      - name: Drift + performance report (fails the run on alert)
+        # Real pipeline: first fetch production logs/ and the baseline from storage.
+        run: |
+          python -m src.monitor_cli simulate --out logs --n 500
+          python -m src.monitor_cli baseline --from-log logs/predictions.jsonl -o reference_stats.json
+          python -m src.monitor_cli report --baseline reference_stats.json --logs logs

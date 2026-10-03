@@ -1,0 +1,37 @@
+# Serving + observability stack:  docker compose up --build
+#   API http://localhost:8000   Prometheus http://localhost:9090   Grafana http://localhost:3000 (admin/admin)
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      MONITOR_LOG_DIR: /app/logs
+    volumes: ["api-logs:/app/logs"]
+    restart: unless-stopped
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [api]
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports: ["3000:3000"]
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+  node-exporter:            # host CPU / memory / disk / network
+    image: prom/node-exporter:v1.8.2
+    ports: ["9100:9100"]
+  cadvisor:                 # per-container CPU / memory
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    ports: ["8080:8080"]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+volumes:
+  api-logs:
